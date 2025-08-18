@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import random
 import gymnasium as gym
+import torch
 from gymnasium import ObservationWrapper
 from gymnasium.spaces import Box
 from stable_baselines3 import PPO
@@ -32,140 +33,62 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from gymnasium import spaces
 from stable_baselines3.common.callbacks import BaseCallback
 from scipy.spatial.distance import cityblock
-
-
+from stable_baselines3.common.utils import obs_as_tensor
+import copy
 import csv
+import pickle
+from torch.utils.data import DataLoader, TensorDataset
 
+from stable_baselines3.common.vec_env import DummyVecEnv
 from tqdm import tqdm
 
-# Пути для лабиринтов и модели
-maze_folder = "./mazes"
-os.makedirs(maze_folder, exist_ok=True)
+from maze_env.maze_build_env import MazeBuilderEnv, CustomTransformerPolicyForBuilder, flatten_trajectories, load_demonstrations, PPOWithImitation
+
+# ==== Параметры ====
+SAVE_PATH = "./generator/generator_agent.zip"
+LOG_CSV = "./generator/generator_log.csv"
+NAVIGATOR_PATH = "./navigator/ppo_maze_agent_v4"
 
 
+CHECKPOINT_DIR = "./generator/builder_checkpoints"
+TOTAL_ITERATIONS = 1000  # например 100 итераций обучения
+STEPS_PER_ITER = 10000  # сколько шагов на итерацию
 
-def generate_maze(
-    width=10,
-    height=10,
-    start_pos=(1, 1),
-    num_traps=0,
-    num_campfires=0,
-    algo='dfs'
-):
-    EMPTY = 0
-    WALL = 1
-    KEY = 2
-    DOOR = 3
-    TRAP = 4
-    CAMPFIRE = 5
-    EXIT = 7
+def train_generator_agent():
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    if width % 2 == 0: width += 1
-    if height % 2 == 0: height += 1
+    # Создание среды
+    env = MazeBuilderEnv(size=5, save_dir="generated_mazes")
 
-    maze = np.ones((height, width), dtype=int)  # Всё сначала стены
-
-    # ==== 1. Алгоритм carve DFS ====
-    def carve_dfs(x, y):
-        dirs = [(2, 0), (-2, 0), (0, 2), (0, -2)]
-        random.shuffle(dirs)
-        for dx, dy in dirs:
-            nx, ny = x + dx, y + dy
-            if 1 <= nx < height - 1 and 1 <= ny < width - 1 and maze[nx, ny] == 1:
-                maze[nx, ny] = 0
-                maze[x + dx // 2, y + dy // 2] = 0
-                carve_dfs(nx, ny)
-
-    # ==== 2. Начинаем с начальной позиции ====
-    if algo == 'dfs':
-        x, y = start_pos
-        maze[x, y] = 0
-        carve_dfs(x, y)
+    # Загрузка или новая модель
+    if os.path.exists(SAVE_PATH):
+        print("Загружаю существующую модель генератора")
+        model = PPO.load(SAVE_PATH)
+        model.set_env(env)
     else:
-        raise NotImplementedError(f"Алгоритм '{algo}' ещё не реализован")
+        print("Создаю новую модель генератора")
+        model = PPO(
+            policy=CustomTransformerPolicyForBuilder,
+            env=env,
+            n_steps=2048,
+            batch_size=64,
+            learning_rate=2.5e-4,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            clip_range=0.2,
+            gae_lambda=0.95,
+            gamma=0.99,
+            verbose=1,
+            tensorboard_log="./ppo_generator_tensorboard"
+        )
 
-    # ==== 3. Утилита проверки тупиков ====
-    def is_dead_end(x, y):
-        empty_neighbors = 0
-        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < height and 0 <= ny < width and maze[nx, ny] == 0:
-                empty_neighbors += 1
-        return empty_neighbors <= 1
+    for i in range(TOTAL_ITERATIONS):
+        print(f"\n[{i+1}/{TOTAL_ITERATIONS}] Итерация обучения генератора")
+        model.learn(total_timesteps=10000, progress_bar=True)
+        model.save(SAVE_PATH)
 
-    # ==== 4. Размещение тайлов (ключ, ловушки и т.д.) ====
-    def place_tile(tile_code, count=1, avoid_dead_ends=True):
-        placed = 0
-        attempts = 0
-        max_attempts = 500
+        
 
-        while placed < count and attempts < max_attempts:
-            x, y = random.randint(1, height - 2), random.randint(1, width - 2)
-            if maze[x, y] == 0:
-                if avoid_dead_ends and is_dead_end(x, y):
-                    attempts += 1
-                    continue
-                maze[x, y] = tile_code
-                placed += 1
-
-        if placed < count:
-            print(f"[!] Предупреждение: удалось разместить только {placed} из {count} тайлов {tile_code}")
-
-    place_tile(KEY, 1)
-    # place_tile(DOOR, 1)  # Дверь отключена, если не нужна
-    place_tile(TRAP, num_traps)
-    place_tile(CAMPFIRE, num_campfires)
-
-    # ==== 5. Размещение ВЫХОДА (EXIT) в стену на границе ====
-    edge_candidates = []
-
-    for i in range(1, height - 1):
-        if maze[i, 1] == 0:
-            edge_candidates.append((i, 0))
-        if maze[i, width - 2] == 0:
-            edge_candidates.append((i, width - 1))
-
-    for j in range(1, width - 1):
-        if maze[1, j] == 0:
-            edge_candidates.append((0, j))
-        if maze[height - 2, j] == 0:
-            edge_candidates.append((height - 1, j))
-
-    if edge_candidates:
-        ex, ey = random.choice(edge_candidates)
-        maze[ex, ey] = EXIT
-    else:
-        print("[!] Не удалось разместить выход в стене!")
-
-    return maze
-
-
-def custom_load_or_generate(maze_size):
-    mazes = []
-    for i in range(1, 101):
-        path = os.path.join(maze_folder, f"maze_{i}.csv")
-        if os.path.exists(path):
-            print(f"Загружаю лабиринт {path}")
-            maze = np.loadtxt(path, delimiter=",", dtype=np.int8)
-        else:
-            print(f"Генерирую лабиринт {path}")
-            maze = generate_maze(maze_size, maze_size, num_traps=0, num_campfires=1)
-            custom_save_maze(maze, path)
-        mazes.append(maze)
-    return mazes
-
-
-def custom_save_maze(maze, path):
-    np.savetxt(path, maze, fmt="%d", delimiter=",")
-
-
-def save_episode_log(log, path="episode_log.csv"):
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["step", "x", "y", "action", "tile", "reward", "health", "has_key"])
-        writer.writerows(log)
-
-
-#
-# if __name__ == "__main__":
-#     train_agent_on_mazes()
+if __name__ == "__main__":
+    train_generator_agent()
+    
