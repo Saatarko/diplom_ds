@@ -207,4 +207,8 @@ marimo/_lsp/
 __marimo__/
 scripts/icon
 scripts/ppo_maze_tensorboard
-temp
+/temp
+
+/replay_box
+/notebooks
+/navigator

@@ -1,10 +1,11 @@
-version: "3.9"
+version: '3.8'
+
 services:
   replay_box:
     build: .
     container_name: replay_box
-    environment:
-      - DISPLAY=:1
     ports:
-      - "5900:5900"
+      - "5900:5900"   # VNC порт
+    environment:
+      - VNC_PASSWORD=secret
     tty: true
